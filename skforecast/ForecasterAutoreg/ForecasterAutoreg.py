@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import sklearn
 import sklearn.pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.base import clone
 from copy import copy
 
@@ -47,6 +48,10 @@ class ForecasterAutoreg(ForecasterBase):
             `int`: include lags from 1 to `lags` (included).
             `list`, `numpy ndarray` or `range`: include only lags present in `lags`.
 
+    scaler_autoreg_features: bool, default `True`
+        Whether to scale autoregressive features (lags) using
+        scikitlearn StandardScaler(with_mean=True, with_std=True).
+
     
     Attributes
     ----------
@@ -78,6 +83,9 @@ class ForecasterAutoreg(ForecasterBase):
         
     training_range: pandas Index
         First and last values of index of the data used during training.
+
+    autoreg_col_names : list
+        Names of autoregressive variables generated from `y`.
         
     included_exog : bool
         If the forecaster has been trained using exogenous variable/s.
@@ -86,8 +94,7 @@ class ForecasterAutoreg(ForecasterBase):
         Type of exogenous variable/s used in training.
         
     exog_col_names : list
-        Names of columns of `exog` if `exog` used in training was a pandas
-        DataFrame.
+        Names of of `exog` variables.
 
     X_train_col_names : list
         Names of columns of the matrix created internally for training.
@@ -106,28 +113,39 @@ class ForecasterAutoreg(ForecasterBase):
     fit_date: str
         Date of last fit.
 
+    scaler_autoreg_features: sklearn.preprocessing, default `StandardScaler()`
+        Scaler used to transform autoregressive features (lags). By default,
+        scikitlearn StandardScaler(with_mean=True, with_std=True) is used.
+
     skforcast_version: str
         Version of skforecast library used to create the forecaster.
      
     '''
     
-    def __init__(self, regressor, lags: Union[int, np.ndarray, list]) -> None:
+    def __init__(
+        self,
+        regressor,
+        lags: Union[int, np.ndarray, list],
+        scaler_autoreg_features: Optional[None] = None
+    ) -> None:
         
-        self.regressor            = regressor
-        self.index_type           = None
-        self.index_freq           = None
-        self.training_range       = None
-        self.last_window          = None
-        self.included_exog        = False
-        self.exog_type            = None
-        self.exog_col_names       = None
-        self.X_train_col_names    = None
-        self.in_sample_residuals  = None
-        self.out_sample_residuals = None
-        self.fitted               = False
-        self.creation_date        = pd.Timestamp.today().strftime('%Y-%m-%d %H:%M:%S')
-        self.fit_date             = None
-        self.skforcast_version    = skforecast.__version__
+        self.regressor              = regressor
+        self.scaler_autoreg_features = scaler_autoreg_features
+        self.index_type             = None
+        self.index_freq             = None
+        self.training_range         = None
+        self.last_window            = None
+        self.autoreg_col_names      = None
+        self.included_exog          = False
+        self.exog_type              = None
+        self.exog_col_names         = None
+        self.X_train_col_names      = None
+        self.in_sample_residuals    = None
+        self.out_sample_residuals   = None
+        self.fitted                 = False
+        self.creation_date          = pd.Timestamp.today().strftime('%Y-%m-%d %H:%M:%S')
+        self.fit_date               = None
+        self.skforcast_version      = skforecast.__version__
         
         if isinstance(lags, int) and lags < 1:
             raise Exception('Minimum value of lags allowed is 1.')
@@ -149,6 +167,9 @@ class ForecasterAutoreg(ForecasterBase):
             
         self.max_lag  = max(self.lags)
         self.window_size = self.max_lag
+
+        if self.scaler_autoreg_features is None:
+            self.scaler_autoreg_features = StandardScaler(copy=False, with_mean=True, with_std=True)
 
 
     def __repr__(self) -> str:
@@ -176,6 +197,7 @@ class ForecasterAutoreg(ForecasterBase):
             f"Training range: {self.training_range.to_list() if self.fitted else None} \n"
             f"Training index type: {str(self.index_type).split('.')[-1][:-2] if self.fitted else None} \n"
             f"Training index frequency: {self.index_freq if self.fitted else None} \n"
+            f"Scaler autoregressive features: {self.scaler_autoreg_features} \n"
             f"Regressor parameters: {params} \n"
             f"Creation date: {self.creation_date} \n"
             f"Last fit date: {self.fit_date} \n"
@@ -228,7 +250,9 @@ class ForecasterAutoreg(ForecasterBase):
     def create_train_X_y(
         self,
         y: pd.Series,
-        exog: Optional[Union[pd.Series, pd.DataFrame]]=None
+        exog: Optional[Union[pd.Series, pd.DataFrame]]=None,
+        scale_autoreg_features: bool=True,
+        use_fitted_scaler: bool=True
     ) -> Tuple[pd.DataFrame, pd.Series]:
         '''
         Create training matrices from univariate time series and exogenous
@@ -243,6 +267,16 @@ class ForecasterAutoreg(ForecasterBase):
             Exogenous variable/s included as predictor/s. Must have the same
             number of observations as `y` and their indexes must be aligned.
 
+        scale_autoreg_features: bool, default `True`
+            Whether to scale autoregressive features obtained from `y` using
+            StandardScaler(with_mean=True, with_std=True).
+
+        use_fitted_scaler : bool, default `True`
+            If `True`, and the internal scaler is already fitted, it is used to
+            scale the autoregressive features. If it is not fitted yet, the scaler
+            is fitted. This is only valid when scale_autoreg_features is `True`.
+
+
         Returns 
         -------
         X_train : pandas DataFrame, shape (len(y) - self.max_lag, len(self.lags))
@@ -255,6 +289,8 @@ class ForecasterAutoreg(ForecasterBase):
         
         check_y(y=y)
         y_values, y_index = preprocess_y(y=y)
+        autoreg_col_names = [f"lag_{i}" for i in self.lags]
+        exog_col_names = []
         
         if exog is not None:
             if len(exog) != len(y):
@@ -270,20 +306,31 @@ class ForecasterAutoreg(ForecasterBase):
                 )
         
         X_train, y_train = self._create_lags(y=y_values)
-        X_train_col_names = [f"lag_{i}" for i in self.lags]
+
+        if scale_autoreg_features:
+            autoreg_col_names = [f"scaled_{col_name}" for col_name in autoreg_col_names]
+            if use_fitted_scaler:
+                try:
+                    X_train = self.scaler.transform(X_train)
+                except:
+                    X_train = self.scaler.fit_transform(X_train)
+            else:
+                X_train = self.scaler.fit_transform(X_train)
+
         if exog is not None:
-            col_names_exog = exog.columns if isinstance(exog, pd.DataFrame) else [exog.name]
-            X_train_col_names.extend(col_names_exog)
+            exog_col_names = \
+                exog.columns.to_list() if isinstance(exog, pd.DataFrame) else [exog.name]
             # The first `self.max_lag` positions have to be removed from exog
             # since they are not in X_train.
             X_train = np.column_stack((X_train, exog_values[self.max_lag:, ]))
+
+        X_train_col_names = autoreg_col_names + exog_col_names
 
         X_train = pd.DataFrame(
                     data    = X_train,
                     columns = X_train_col_names,
                     index   = y_index[self.max_lag: ]
                   )
-        self.X_train_col_names = X_train_col_names
         y_train = pd.Series(
                     data  = y_train,
                     index = y_index[self.max_lag: ],
@@ -331,13 +378,25 @@ class ForecasterAutoreg(ForecasterBase):
         self.fitted               = False
         self.training_range       = None
         
+        if self.scale_autoreg_features:
+            self.autoreg_col_names = [f"scaled_lag_{i}" for i in self.lags]
+        else:
+            self.autoreg_col_names = [f"lag_{i}" for i in self.lags]
+
+        self.exog_col_names = []
         if exog is not None:
             self.included_exog = True
             self.exog_type = type(exog)
             self.exog_col_names = \
-                 exog.columns.to_list() if isinstance(exog, pd.DataFrame) else exog.name
+                 exog.columns.to_list() if isinstance(exog, pd.DataFrame) else [exog.name]
+
+        self.X_train_col_names = self.autoreg_col_names + self.exog_col_names
  
-        X_train, y_train = self.create_train_X_y(y=y, exog=exog)
+        X_train, y_train = self.create_train_X_y(
+                            y = y,
+                            exog = exog,
+                            scale_autoreg_features = self.scale_autoreg_features
+                          )
 
         if not str(type(self.regressor)) == "<class 'xgboost.sklearn.XGBRegressor'>":
             self.regressor.fit(X=X_train, y=y_train)
@@ -396,18 +455,16 @@ class ForecasterAutoreg(ForecasterBase):
         '''
 
         predictions = np.full(shape=steps, fill_value=np.nan)
-
+        X_pred = pd.DataFrame(columns=self.X_train_col_names, index=[0])
         for i in range(steps):
             X = last_window[-self.lags].reshape(1, -1)
+            if self.scale_autoreg_features:
+                X = self.scaler.transform(X)
             if exog is not None:
                 X = np.column_stack((X, exog[i, ].reshape(1, -1)))
-
-            with warnings.catch_warnings():
-                # Suppress scikitlearn warning: "X does not have valid feature names,
-                # but NoOpTransformer was fitted with feature names".
-                warnings.simplefilter("ignore")
-                prediction = self.regressor.predict(X)
-                predictions[i] = prediction.ravel()[0]
+            X_pred.iloc[0,: ] = X
+            prediction = self.regressor.predict(X_pred)
+            predictions[i] = prediction.ravel()[0]
 
             # Update `last_window` values. The first position is discarded and 
             # the new prediction is added at the end.
@@ -665,7 +722,7 @@ class ForecasterAutoreg(ForecasterBase):
             Number of bootstrapping iterations used to estimate prediction
             intervals.
 
-        random_state: int, default 123
+        random_state: int
             Sets a seed to the random generator, so that boot intervals are always 
             deterministic.
             
@@ -892,12 +949,13 @@ class ForecasterAutoreg(ForecasterBase):
         
         if isinstance(self.regressor, sklearn.pipeline.Pipeline):
             estimator = self.regressor[-1]
+            feature_names = self.regressor[:-1].get_feature_names_out()
         else:
             estimator = self.regressor
-
+            feature_names = self.X_train_col_names
         try:
             coef = pd.DataFrame({
-                        'feature': self.X_train_col_names,
+                        'feature': feature_names,
                         'coef' : estimator.coef_
                    })
         except:
@@ -930,12 +988,14 @@ class ForecasterAutoreg(ForecasterBase):
 
         if isinstance(self.regressor, sklearn.pipeline.Pipeline):
             estimator = self.regressor[-1]
+            feature_names = self.regressor[:-1].get_feature_names_out()
         else:
             estimator = self.regressor
+            feature_names = self.X_train_col_names
 
         try:
             feature_importance = pd.DataFrame({
-                                    'feature': self.X_train_col_names,
+                                    'feature': feature_names,
                                     'importance' : estimator.feature_importances_
                                 })
         except:
